@@ -1,0 +1,10 @@
+settings:
+  # Private-fork identity. Leave DEVELOPMENT_TEAM empty: Xcode supplies the
+  # local Personal Team while this fork is used for development.
+  APP_DISPLAY_NAME: Whistlepig
+  PRODUCTION_APP_NAME: Whistlepig
+  APP_GROUP_IDENTIFIER: group.me.softtryme.whistlepig
+  BASE_BUNDLE_IDENTIFIER: me.softtryme.whistlepig
+  ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: "colors/accent-color"
+  DEVELOPMENT_TEAM: L9FKYS2CM5
+  IS_NIGHTLY_BUILD: false

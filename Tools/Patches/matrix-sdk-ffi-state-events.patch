@@ -1,0 +1,57 @@
+diff --git a/bindings/matrix-sdk-ffi/src/room/mod.rs b/bindings/matrix-sdk-ffi/src/room/mod.rs
+index 08782ec..8292fef 100644
+--- a/bindings/matrix-sdk-ffi/src/room/mod.rs
++++ b/bindings/matrix-sdk-ffi/src/room/mod.rs
+@@ -474,6 +474,16 @@ impl Room {
+         Ok(response.event_id.to_string())
+     }
+
++    /// Returns all state events of `event_type` as JSON strings.
++    pub async fn state_events_raw(&self, event_type: String) -> Result<Vec<String>, ClientError> {
++        self.inner
++            .get_state_events(event_type.into())
++            .await?
++            .into_iter()
++            .map(|event| serde_json::to_string(&event).map_err(ClientError::from))
++            .collect()
++    }
++
+     /// Redacts an event from the room.
+     ///
+     /// # Arguments
+diff --git a/bindings/matrix-sdk-ffi/src/client.rs b/bindings/matrix-sdk-ffi/src/client.rs
+index 5e5024d..7088e0f 100644
+--- a/bindings/matrix-sdk-ffi/src/client.rs
++++ b/bindings/matrix-sdk-ffi/src/client.rs
+@@ -88,6 +88,7 @@ use ruma::{
+             profile::{AvatarUrl, Call, DisplayName, ProfileFieldName, StaticProfileField, Status},
+             room::create_room::{RoomPowerLevelsContentOverride, v3::CreationContent},
+             rtc::RtcTransport,
++            state::get_state_events,
+             uiaa::{EmailUserIdentifier, UserIdentifier},
+         },
+         error::ErrorKind,
+@@ -1462,6 +1463,23 @@ impl Client {
+         Ok(event.map(|e| e.json().get().to_owned()))
+     }
+ 
++    /// Fetch the content of an account data event directly from the homeserver.
++    pub async fn fetch_account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
++        let event = self.inner.account().fetch_account_data(event_type.into()).await?;
++        Ok(event.map(|e| e.json().get().to_owned()))
++    }
++
++    /// Fetch all room state events directly from the homeserver as JSON strings.
++    pub async fn fetch_state_events_raw(&self, room_id: String) -> Result<Vec<String>, ClientError> {
++        let room_id = RoomId::parse(room_id)?;
++        let response = self.inner.send(get_state_events::v3::Request::new(room_id)).await?;
++        response
++            .room_state
++            .into_iter()
++            .map(|event| serde_json::to_string(&event).map_err(ClientError::from))
++            .collect()
++    }
++
+     /// Set the given account data content for the given event type.
+     ///
+     /// It should be supplied as a JSON string.

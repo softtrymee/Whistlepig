@@ -1,0 +1,286 @@
+//
+// Copyright 2025 Element Creations Ltd.
+// Copyright 2022-2025 New Vector Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial.
+// Please see LICENSE files in the repository root for full details.
+//
+
+import Combine
+import Foundation
+import MatrixRustSDK
+
+class AuthenticationService: AuthenticationServiceProtocol {
+    private var client: ClientProtocol?
+    private var sessionDirectories: SessionDirectories
+    private let passphrase: String
+    
+    private let userSessionStore: UserSessionStoreProtocol
+    private let clientFactory: AuthenticationClientFactoryProtocol
+    private let appSettings: AppSettings
+    private let appHooks: AppHooks
+    
+    private let homeserverSubject: CurrentValueSubject<LoginHomeserver, Never>
+    var homeserver: CurrentValuePublisher<LoginHomeserver, Never> {
+        homeserverSubject.asCurrentValuePublisher()
+    }
+    
+    private(set) var flow: AuthenticationFlow
+    
+    init(userSessionStore: UserSessionStoreProtocol,
+         encryptionKeyProvider: EncryptionKeyProviderProtocol,
+         clientFactory: AuthenticationClientFactoryProtocol = AuthenticationClientFactory(),
+         appSettings: AppSettings,
+         appHooks: AppHooks) {
+        sessionDirectories = .init()
+        passphrase = encryptionKeyProvider.generateKey().base64EncodedString()
+        
+        self.userSessionStore = userSessionStore
+        self.clientFactory = clientFactory
+        self.appSettings = appSettings
+        self.appHooks = appHooks
+        
+        // When updating these, don't forget to update the reset method too.
+        homeserverSubject = .init(LoginHomeserver(address: appSettings.defaultServer, loginMode: .unknown))
+        flow = .login
+    }
+    
+    // MARK: - Public
+    
+    func configure(for homeserverAddress: String, flow: AuthenticationFlow) async -> Result<Void, AuthenticationServiceError> {
+        do {
+            var homeserver = LoginHomeserver(address: homeserverAddress, loginMode: .unknown)
+            
+            let client = try await makeClient(homeserverAddress: homeserverAddress)
+            let loginDetails = await client.homeserverLoginDetails()
+            
+            homeserver.loginMode = if loginDetails.supportsOauthLogin() {
+                .oAuth(supportsCreatePrompt: loginDetails.supportedOauthPrompts().contains(.create))
+            } else if loginDetails.supportsPasswordLogin() {
+                .password
+            } else {
+                .unsupported
+            }
+            
+            if flow == .login, homeserver.loginMode == .unsupported {
+                return .failure(.loginNotSupported)
+            }
+            if flow == .register, !homeserver.loginMode.supportsOAuthFlow {
+                return .failure(.registrationNotSupported)
+            }
+            
+            self.client = client
+            self.flow = flow
+            homeserverSubject.send(homeserver)
+            return .success(())
+        } catch ClientBuildError.WellKnownDeserializationError(let error) {
+            MXLog.error("The user entered a server with an invalid well-known file: \(error)")
+            return .failure(.invalidWellKnown(error))
+        } catch ClientBuildError.SlidingSyncVersion(let error) {
+            MXLog.info("User entered a homeserver that isn't configured for sliding sync: \(error)")
+            return .failure(.slidingSyncNotAvailable)
+        } catch {
+            MXLog.error("Failed configuring a server: \(error)")
+            return .failure(.invalidHomeserverAddress)
+        }
+    }
+    
+    func urlForOAuthLogin(loginHint: String?) async -> Result<OAuthAuthorizationDataProxy, AuthenticationServiceError> {
+        guard let client else { return .failure(.oAuthError(.urlFailure)) }
+        do {
+            // The create prompt is broken: https://github.com/element-hq/matrix-authentication-service/issues/3429
+            // let prompt: OAuthPrompt = flow == .register ? .create : .consent
+            let oAuthData = try await client.urlForOauth(oauthConfiguration: appSettings.oAuthConfiguration.rustValue,
+                                                         prompt: .consent,
+                                                         loginHint: loginHint,
+                                                         deviceId: nil,
+                                                         additionalScopes: nil)
+            return .success(OAuthAuthorizationDataProxy(underlyingData: oAuthData))
+        } catch {
+            MXLog.error("Failed to get URL for OAuth login: \(error)")
+            return .failure(.oAuthError(.urlFailure))
+        }
+    }
+    
+    func abortOAuthLogin(data: OAuthAuthorizationDataProxy) async {
+        guard let client else { return }
+        MXLog.info("Aborting OAuth login.")
+        await client.abortOauthAuth(authorizationData: data.underlyingData)
+    }
+    
+    func loginWithOAuthCallback(_ callbackURL: URL) async -> Result<UserSessionProtocol, AuthenticationServiceError> {
+        guard let client else { return .failure(.failedLoggingIn) }
+        do {
+            try await client.loginWithOauthCallback(callbackUrl: callbackURL.absoluteString)
+            return await userSession(for: client)
+        } catch MatrixRustSDK.OAuthError.Cancelled {
+            return .failure(.oAuthError(.userCancellation))
+        } catch {
+            MXLog.error("Login with OAuth failed: \(error)")
+            return .failure(.failedLoggingIn)
+        }
+    }
+    
+    func login(username: String, password: String, initialDeviceName: String?, deviceID: String?) async -> Result<UserSessionProtocol, AuthenticationServiceError> {
+        guard let client else { return .failure(.failedLoggingIn) }
+        do {
+            try await client.login(username: username, password: password, initialDeviceName: initialDeviceName, deviceId: deviceID)
+            
+            let refreshToken = try? client.session().refreshToken
+            if refreshToken != nil {
+                MXLog.warning("Refresh token found for a non OAuth session, can't restore session, logging out")
+                _ = try? await client.logout()
+                return .failure(.sessionTokenRefreshNotSupported)
+            }
+            
+            return await userSession(for: client)
+        } catch let ClientError.MatrixApi(errorKind, _, _, _) {
+            MXLog.error("Failed logging in with error kind: \(errorKind)")
+            switch errorKind {
+            case .forbidden:
+                return .failure(.invalidCredentials)
+            case .userDeactivated:
+                return .failure(.accountDeactivated)
+            default:
+                return .failure(.failedLoggingIn)
+            }
+        } catch {
+            MXLog.error("Failed logging in with error: \(error)")
+            return .failure(.failedLoggingIn)
+        }
+    }
+    
+    func loginWithQRCode(data: Data) -> QRLoginProgressPublisher {
+        let progressSubject = CurrentValueSubject<QRLoginProgress, AuthenticationServiceError>(.starting)
+        
+        let qrData: QrCodeData
+        do {
+            qrData = try QrCodeData.fromBytes(bytes: data)
+        } catch {
+            MXLog.error("QRCode decode error: \(error)")
+            progressSubject.send(completion: .failure(.qrCodeError(.invalidQRCode)))
+            return progressSubject.asCurrentValuePublisher()
+        }
+        
+        // n.b. We rely on the SDK checking that the intent of the QR is suitable for us to login with.
+        
+        // Future versions of the QR should always give us the baseUrl
+        guard let scannedServerNameOrBaseUrl = qrData.baseUrl() ?? qrData.serverName() else {
+            // With the older version of QR we treat the presence of serverName as meaning that the other device
+            // is not signed in.
+            MXLog.error("The QR code is from a device that is not yet signed in.")
+            progressSubject.send(completion: .failure(.qrCodeError(.deviceNotSignedIn)))
+            return progressSubject.asCurrentValuePublisher()
+        }
+        
+        // n.b. We deliberatley don't check whether the received server is in our appSettings.accountProviders
+        
+        // The SDK calls the listener from arbitrary threads; onMainActor forwards the progress
+        // updates on the main actor in FIFO order.
+        let listener = SDKListener.onMainActor { rustProgress in
+            guard let progress = QRLoginProgress(rustProgress: rustProgress) else { return }
+            progressSubject.send(progress)
+        }
+        
+        Task {
+            do {
+                let client = try await makeClient(homeserverAddress: scannedServerNameOrBaseUrl)
+                let qrCodeHandler = client.newLoginWithQrCodeHandler(oauthConfiguration: appSettings.oAuthConfiguration.rustValue)
+                try await qrCodeHandler.scan(qrCodeData: qrData, progressListener: listener)
+                
+                // Since the QR code login flow includes verification.
+                appSettings.hasRunIdentityConfirmationOnboarding = true
+                
+                switch await userSession(for: client) {
+                case .success(let userSession):
+                    progressSubject.send(.signedIn(userSession))
+                case .failure(let error):
+                    progressSubject.send(completion: .failure(error))
+                }
+            } catch let error as HumanQrLoginError {
+                MXLog.error("QRCode login error: \(error)")
+                progressSubject.send(completion: .failure(error.serviceError))
+            } catch {
+                MXLog.error("QRCode login unknown error: \(error)")
+                progressSubject.send(completion: .failure(.qrCodeError(.unknown)))
+            }
+        }
+        
+        return progressSubject.asCurrentValuePublisher()
+    }
+    
+    func reset() {
+        homeserverSubject.send(LoginHomeserver(address: appSettings.defaultServer, loginMode: .unknown))
+        flow = .login
+        client = nil
+    }
+    
+    // MARK: - Private
+    
+    private func makeClient(homeserverAddress: String) async throws -> ClientProtocol {
+        // Use a fresh session directory each time the user enters a different server
+        // so that caches (e.g. server versions) are always fresh for the new server.
+        rotateSessionDirectory()
+        
+        let client = try await clientFactory.makeClient(homeserverAddress: homeserverAddress,
+                                                        sessionDirectories: sessionDirectories,
+                                                        passphrase: passphrase,
+                                                        clientSessionDelegate: userSessionStore.clientSessionDelegate,
+                                                        appSettings: appSettings,
+                                                        appHooks: appHooks)
+        try await appHooks.remoteSettingsHook.initializeCache(using: client, applyingTo: appSettings).get()
+        
+        return client
+    }
+    
+    private func rotateSessionDirectory() {
+        sessionDirectories.delete()
+        sessionDirectories = .init()
+    }
+    
+    private func userSession(for client: ClientProtocol) async -> Result<UserSessionProtocol, AuthenticationServiceError> {
+        switch await userSessionStore.userSession(for: client, sessionDirectories: sessionDirectories, passphrase: passphrase) {
+        case .success(let clientProxy):
+            return .success(clientProxy)
+        case .failure:
+            return .failure(.failedLoggingIn)
+        }
+    }
+}
+
+private extension HumanQrLoginError {
+    var serviceError: AuthenticationServiceError {
+        switch self {
+        case .Cancelled:
+            .qrCodeError(.cancelled)
+        case .ConnectionInsecure:
+            .qrCodeError(.connectionInsecure)
+        case .Declined:
+            .qrCodeError(.declined)
+        case .LinkingNotSupported:
+            .qrCodeError(.linkingNotSupported)
+        case .Expired, .NotFound: // The most likely cause of a .NotFound is that the rendezvous session expired on the server side
+            .qrCodeError(.expired)
+        case .SlidingSyncNotAvailable:
+            .qrCodeError(.slidingSyncNotAvailable)
+        case .OtherDeviceNotSignedIn:
+            .qrCodeError(.deviceNotSignedIn)
+        case .UnsupportedQrCodeType:
+            .qrCodeError(.invalidQRCode)
+        case .Unknown, .OAuthMetadataInvalid, .CheckCodeAlreadySent, .CheckCodeCannotBeSent, .ContinuationAlreadySent, .ContinuationCannotBeSent:
+            .qrCodeError(.unknown)
+        }
+    }
+}
+
+// MARK: - Mocks
+
+extension AuthenticationService {
+    static var mock: AuthenticationService {
+        AuthenticationService(userSessionStore: UserSessionStoreMock(.init()),
+                              encryptionKeyProvider: EncryptionKeyProvider(),
+                              clientFactory: AuthenticationClientFactoryMock(.init()),
+                              appSettings: .volatile(),
+                              appHooks: AppHooks())
+    }
+}
